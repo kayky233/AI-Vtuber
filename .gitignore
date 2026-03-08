@@ -155,3 +155,13 @@ cython_debug/
 output.mp3
 output.txt
 tmp_*.mp3
+live_subtitle.txt
+live_subtitle_origin.txt
+live_subtitle_translated.txt
+live_subtitles.log
+live_subtitles_stdout.log
+live_subtitles_stderr.log
+subtitle_audio_relay.log
+subtitle_overlay.log
+tmp_subtitles/
+tmp_subtitles_*/

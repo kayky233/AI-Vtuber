@@ -88,10 +88,10 @@ class SimpleChatBot:
     def reload(self) -> None:
         self._pairs = load_pairs(self.database_path)
 
-    def get_response(self, prompt: str) -> BotResponse:
+    def find_best_response(self, prompt: str) -> tuple[BotResponse | None, float]:
         normalized_prompt = _normalize_text(prompt)
         if not normalized_prompt:
-            return BotResponse(random.choice(self.fallback_responses))
+            return None, 0.0
 
         best_score = 0.0
         best_answer = None
@@ -101,6 +101,12 @@ class SimpleChatBot:
                 best_score = score
                 best_answer = answer
 
-        if best_answer and best_score >= 0.55:
-            return BotResponse(best_answer)
+        if best_answer:
+            return BotResponse(best_answer), best_score
+        return None, 0.0
+
+    def get_response(self, prompt: str) -> BotResponse:
+        best_response, best_score = self.find_best_response(prompt)
+        if best_response is not None and best_score >= 0.55:
+            return best_response
         return BotResponse(random.choice(self.fallback_responses))

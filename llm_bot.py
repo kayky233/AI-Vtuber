@@ -74,6 +74,10 @@ def _read_float(name: str, default: float) -> float:
         return default
 
 
+def _clamp(value: float, minimum: float, maximum: float) -> float:
+    return max(minimum, min(maximum, value))
+
+
 def _provider_order() -> list[str]:
     raw = os.getenv("VTUBER_LLM_ORDER", "deepseek,glm,openai")
     return [item.strip().lower() for item in raw.split(",") if item.strip()]
@@ -171,12 +175,22 @@ class LLMChatBot:
         }
         self.local_fallback = local_fallback
         self.system_prompt = os.getenv("VTUBER_SYSTEM_PROMPT", DEFAULT_SYSTEM_PROMPT).strip()
-        self.temperature = _read_float("VTUBER_LLM_TEMPERATURE", 0.85)
-        self.max_tokens = _read_int("VTUBER_LLM_MAX_TOKENS", 120)
-        self.history_pairs = max(_read_int("VTUBER_HISTORY_PAIRS", 4), 0)
-        self.timeout = max(_read_float("VTUBER_LLM_TIMEOUT", 30.0), 1.0)
+        self.temperature = _read_float("VTUBER_LLM_TEMPERATURE", 0.75)
+        self.max_tokens = _read_int("VTUBER_LLM_MAX_TOKENS", 80)
+        self.history_pairs = max(_read_int("VTUBER_HISTORY_PAIRS", 2), 0)
+        self.timeout = max(_read_float("VTUBER_LLM_TIMEOUT", 12.0), 1.0)
+        self.reply_deadline = max(_read_float("VTUBER_REPLY_DEADLINE", 6.0), 0.5)
+        self.provider_timeout = max(_read_float("VTUBER_PROVIDER_TIMEOUT", 4.0), 0.5)
         self.provider_retry_after = max(_read_int("VTUBER_PROVIDER_RETRY_AFTER", 300), 1)
-        self._semaphore = asyncio.Semaphore(max(_read_int("VTUBER_LLM_CONCURRENCY", 2), 1))
+        self.provider_timeout_retry_after = max(
+            _read_int("VTUBER_PROVIDER_TIMEOUT_RETRY_AFTER", 45), 1
+        )
+        self.local_first_score = _clamp(
+            _read_float("VTUBER_LOCAL_FIRST_SCORE", 0.92),
+            0.0,
+            1.0,
+        )
+        self._semaphore = asyncio.Semaphore(max(_read_int("VTUBER_LLM_CONCURRENCY", 3), 1))
         self._client = (
             httpx.AsyncClient(timeout=httpx.Timeout(self.timeout))
             if self.providers
@@ -205,23 +219,48 @@ class LLMChatBot:
             return self._fallback_response(prompt)
 
         async with self._semaphore:
+            local_first = self._fast_local_response(prompt)
+            if local_first is not None:
+                self._remember_turn(user_id, prompt, local_first.text)
+                return local_first
+
+            overall_deadline = time.monotonic() + self.reply_deadline
             last_error: Exception | None = None
             for provider in self.providers:
                 disabled_until = self._provider_disabled_until.get(provider.name, 0.0)
                 if disabled_until > time.time():
                     continue
+
+                remaining_time = overall_deadline - time.monotonic()
+                if remaining_time <= 0:
+                    break
+
+                request_timeout = min(self.timeout, self.provider_timeout, remaining_time)
                 try:
-                    response_text = await self._request_provider(provider, prompt, user_id)
+                    response_text = await asyncio.wait_for(
+                        self._request_provider(provider, prompt, user_id),
+                        timeout=request_timeout,
+                    )
+                except asyncio.TimeoutError:
+                    last_error = RuntimeError(
+                        f"{provider.name} timed out after {request_timeout:.1f}s"
+                    )
+                    self._provider_disabled_until[provider.name] = (
+                        time.time() + self.provider_timeout_retry_after
+                    )
+                    print(f"[{provider.name}超时]：{request_timeout:.1f}s")
                 except Exception as error:
                     last_error = error
                     self._provider_disabled_until[provider.name] = (
                         time.time() + self.provider_retry_after
                     )
                     print(f"[{provider.name}错误]：{error}")
-                    continue
+                else:
+                    self._remember_turn(user_id, prompt, response_text)
+                    return BotResponse(response_text)
 
-                self._remember_turn(user_id, prompt, response_text)
-                return BotResponse(response_text)
+                if time.monotonic() >= overall_deadline:
+                    break
 
         if self.local_fallback_enabled and self.local_fallback is not None:
             fallback = self.local_fallback.get_response(prompt)
@@ -283,6 +322,15 @@ class LLMChatBot:
         history = self._histories[user_id]
         history.append({"role": "user", "content": prompt})
         history.append({"role": "assistant", "content": response_text})
+
+    def _fast_local_response(self, prompt: str) -> BotResponse | None:
+        if self.local_fallback is None:
+            return None
+
+        best_response, best_score = self.local_fallback.find_best_response(prompt)
+        if best_response is None or best_score < self.local_first_score:
+            return None
+        return best_response
 
     def _fallback_response(self, prompt: str) -> BotResponse:
         if self.local_fallback is not None:

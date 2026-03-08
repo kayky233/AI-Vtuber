@@ -26,6 +26,12 @@ pip install bilibili-api-python edge-tts httpx
    - `VTUBER_LLM_ORDER`，例如 `deepseek,glm,openai`
    - `local_settings.py` 里的本地默认值会在没有环境变量时自动生效，环境变量优先级更高
 2. 如果三家接口都失败，程序会自动回退到本地 `db.sqlite3` 语料库。
+   常用加速参数：
+   - `VTUBER_REPLY_DEADLINE`：整条回复链路的总时限，默认 `6`
+   - `VTUBER_PROVIDER_TIMEOUT`：单个模型的等待上限，默认 `4`
+   - `VTUBER_LLM_MAX_TOKENS`：回复长度上限，默认 `80`
+   - `VTUBER_HISTORY_PAIRS`：带给模型的历史轮数，默认 `2`
+   - `VTUBER_LOCAL_FIRST_SCORE`：高相似度本地语料直接秒回的阈值，默认 `0.92`
 3. 语音配置：
    - 默认是 Edge TTS
    - `TTS_PROVIDER=edge`
