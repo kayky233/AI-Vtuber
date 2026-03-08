@@ -88,7 +88,13 @@ SUBTITLE_SOURCE_URL
 
 ## Current Local Settings
 
-`local_settings.py` is intentionally ignored by Git. The current local defaults are:
+`local_settings.py` is intentionally ignored by Git. The committed template is:
+
+- `local_settings.example.py`
+
+Copy it to `local_settings.py` and adjust machine-specific paths and devices.
+
+The current local defaults are:
 
 ```python
 "SUBTITLE_ASR_BACKEND": "persistent_faster_whisper",
