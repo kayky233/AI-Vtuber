@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import re
 from dataclasses import dataclass
 from http import HTTPStatus
@@ -11,46 +10,19 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-try:
-    from local_settings import SETTINGS as LOCAL_SETTINGS
-except Exception:
-    LOCAL_SETTINGS: dict[str, Any] = {}
+from settings_utils import (
+    load_local_settings,
+    read_int,
+    read_str,
+    resolve_path,
+)
+
+LOCAL_SETTINGS: dict[str, Any] = load_local_settings()
 
 
 PROJECT_DIR = Path(__file__).resolve().parent
 HTML_PATH = PROJECT_DIR / "subtitle_overlay.html"
 TIMESTAMP_LINE_RE = re.compile(r"^\[(\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]$")
-
-
-def _read_setting(name: str) -> Any:
-    value = os.getenv(name)
-    if value is not None and value != "":
-        return value
-    return LOCAL_SETTINGS.get(name)
-
-
-def _read_str(name: str, default: str) -> str:
-    value = _read_setting(name)
-    if value is None:
-        return default
-    return str(value).strip()
-
-
-def _read_int(name: str, default: int) -> int:
-    value = _read_setting(name)
-    if value in (None, ""):
-        return default
-    try:
-        return int(value)
-    except ValueError:
-        return default
-
-
-def _resolve_path(raw_path: str) -> Path:
-    path = Path(raw_path)
-    if path.is_absolute():
-        return path
-    return PROJECT_DIR / path
 
 
 def _read_text(path: Path) -> str:
@@ -134,14 +106,23 @@ class OverlayConfig:
 
 def load_config() -> OverlayConfig:
     return OverlayConfig(
-        host=_read_str("SUBTITLE_OVERLAY_HOST", "127.0.0.1"),
-        port=max(_read_int("SUBTITLE_OVERLAY_PORT", 18082), 1),
-        output_path=_resolve_path(_read_str("SUBTITLE_OUTPUT_PATH", "live_subtitle.txt")),
-        origin_output_path=_resolve_path(
-            _read_str("SUBTITLE_ORIGIN_OUTPUT_PATH", "live_subtitle_origin.txt")
+        host=read_str("SUBTITLE_OVERLAY_HOST", "127.0.0.1", LOCAL_SETTINGS),
+        port=max(read_int("SUBTITLE_OVERLAY_PORT", 18082, LOCAL_SETTINGS), 1),
+        output_path=resolve_path(
+            read_str("SUBTITLE_OUTPUT_PATH", "live_subtitle.txt", LOCAL_SETTINGS),
+            PROJECT_DIR,
         ),
-        translated_output_path=_resolve_path(
-            _read_str("SUBTITLE_TRANSLATED_OUTPUT_PATH", "live_subtitle_translated.txt")
+        origin_output_path=resolve_path(
+            read_str("SUBTITLE_ORIGIN_OUTPUT_PATH", "live_subtitle_origin.txt", LOCAL_SETTINGS),
+            PROJECT_DIR,
+        ),
+        translated_output_path=resolve_path(
+            read_str(
+                "SUBTITLE_TRANSLATED_OUTPUT_PATH",
+                "live_subtitle_translated.txt",
+                LOCAL_SETTINGS,
+            ),
+            PROJECT_DIR,
         ),
     )
 
@@ -171,6 +152,26 @@ def build_payload(config: OverlayConfig) -> dict[str, Any]:
     }
 
 
+class OverlayPayloadCache:
+    def __init__(self) -> None:
+        self._payload: dict[str, Any] | None = None
+        self._signature: tuple[float | None, float | None, float | None] | None = None
+
+    def get_payload(self, config: OverlayConfig) -> dict[str, Any]:
+        signature = (
+            _mtime(config.output_path),
+            _mtime(config.origin_output_path),
+            _mtime(config.translated_output_path),
+        )
+        if self._payload is None or signature != self._signature:
+            self._payload = build_payload(config)
+            self._signature = signature
+        return self._payload
+
+
+PAYLOAD_CACHE = OverlayPayloadCache()
+
+
 class OverlayHandler(BaseHTTPRequestHandler):
     server_version = "SubtitleOverlay/1.0"
 
@@ -184,7 +185,7 @@ class OverlayHandler(BaseHTTPRequestHandler):
             self._serve_html()
             return
         if parsed.path == "/api/subtitle":
-            self._serve_json(build_payload(self.config))
+            self._serve_json(PAYLOAD_CACHE.get_payload(self.config))
             return
         if parsed.path == "/healthz":
             self._serve_json({"ok": True})

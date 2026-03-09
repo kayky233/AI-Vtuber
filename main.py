@@ -1,7 +1,6 @@
 import asyncio
 import contextlib
 from dataclasses import dataclass
-import os
 from pathlib import Path
 import re
 import subprocess
@@ -17,13 +16,18 @@ if sys.platform == "win32":
 from bilibili_api import live, select_client, user as bilibili_user
 
 from llm_bot import LLMChatBot
+from settings_utils import (
+    load_local_settings,
+    read_bool,
+    read_float,
+    read_int,
+    read_str,
+    resolve_path,
+)
 from simple_bot import SimpleChatBot
 from tts_engine import close_tts, describe_settings, synthesize_to_file
 
-try:
-    from local_settings import SETTINGS as LOCAL_SETTINGS
-except Exception:
-    LOCAL_SETTINGS: dict[str, Any] = {}
+LOCAL_SETTINGS: dict[str, Any] = load_local_settings()
 
 
 PROJECT_DIR = Path(__file__).resolve().parent
@@ -57,82 +61,69 @@ class WelcomeTask:
     created_at: float
 
 
-def _read_setting(name: str) -> Any:
-    value = os.getenv(name)
-    if value is not None and value != "":
-        return value
-    return LOCAL_SETTINGS.get(name)
-
-
-def _read_bool(name: str, default: bool) -> bool:
-    value = _read_setting(name)
-    if value is None:
-        return default
-    return str(value).strip().lower() in {"1", "true", "yes", "on"}
-
-
-def _read_float(name: str, default: float) -> float:
-    value = _read_setting(name)
-    if value in (None, ""):
-        return default
-    try:
-        return float(value)
-    except ValueError:
-        return default
-
-
-def _read_int(name: str, default: int) -> int:
-    value = _read_setting(name)
-    if value in (None, ""):
-        return default
-    try:
-        return int(value)
-    except ValueError:
-        return default
-
-
-def _read_str(name: str, default: str) -> str:
-    value = _read_setting(name)
-    if value is None:
-        return default
-    return str(value).strip()
-
-
-def _resolve_path(raw_path: str) -> Path:
-    path = Path(raw_path)
-    if path.is_absolute():
-        return path
-    return PROJECT_DIR / path
-
-
-WELCOME_ENABLED = _read_bool("WELCOME_ENABLED", True)
-WELCOME_MIN_INTERVAL_SECONDS = _read_float("WELCOME_MIN_INTERVAL_SECONDS", 8.0)
-WELCOME_USER_COOLDOWN_SECONDS = _read_float("WELCOME_USER_COOLDOWN_SECONDS", 300.0)
-WELCOME_MAX_AUDIO_QUEUE = _read_int("WELCOME_MAX_AUDIO_QUEUE", 2)
-WELCOME_ON_FIRST_DANMU = _read_bool("WELCOME_ON_FIRST_DANMU", True)
-WELCOME_DEBUG = _read_bool("WELCOME_DEBUG", False)
-AUDIO_SYNTH_WORKERS = max(_read_int("AUDIO_SYNTH_WORKERS", 2), 1)
-MPV_VOLUME = _read_float("MPV_VOLUME", 100.0)
-MPV_AUDIO_DEVICE = _read_str("MPV_AUDIO_DEVICE", "")
-MPV_AF = _read_str("MPV_AF", "")
-HEARTBEAT_ENABLED = _read_bool("HEARTBEAT_ENABLED", False)
-HEARTBEAT_INTERVAL_SECONDS = max(_read_float("HEARTBEAT_INTERVAL_SECONDS", 180.0), 30.0)
-HEARTBEAT_MAX_AUDIO_QUEUE = max(_read_int("HEARTBEAT_MAX_AUDIO_QUEUE", 1), 0)
-SUBTITLE_AUTOSTART = _read_bool("SUBTITLE_AUTOSTART", False)
-SUBTITLE_SCRIPT_PATH = _resolve_path(_read_str("SUBTITLE_SCRIPT_PATH", "live_subtitles.py"))
-SUBTITLE_LOG_PATH = _resolve_path(_read_str("SUBTITLE_LOG_PATH", "live_subtitles.log"))
-SUBTITLE_OVERLAY_AUTOSTART = _read_bool("SUBTITLE_OVERLAY_AUTOSTART", False)
-SUBTITLE_OVERLAY_SCRIPT_PATH = _resolve_path(
-    _read_str("SUBTITLE_OVERLAY_SCRIPT_PATH", "subtitle_overlay_server.py")
+WELCOME_ENABLED = read_bool("WELCOME_ENABLED", True, LOCAL_SETTINGS)
+WELCOME_MIN_INTERVAL_SECONDS = read_float(
+    "WELCOME_MIN_INTERVAL_SECONDS",
+    8.0,
+    LOCAL_SETTINGS,
 )
-SUBTITLE_OVERLAY_LOG_PATH = _resolve_path(
-    _read_str("SUBTITLE_OVERLAY_LOG_PATH", "subtitle_overlay.log")
+WELCOME_USER_COOLDOWN_SECONDS = read_float(
+    "WELCOME_USER_COOLDOWN_SECONDS",
+    300.0,
+    LOCAL_SETTINGS,
 )
-SUBTITLE_OVERLAY_HOST = _read_str("SUBTITLE_OVERLAY_HOST", "127.0.0.1")
-SUBTITLE_OVERLAY_PORT = max(_read_int("SUBTITLE_OVERLAY_PORT", 18082), 1)
-RESOLVE_MASKED_USER_NAMES = _read_bool("RESOLVE_MASKED_USER_NAMES", True)
+WELCOME_MAX_AUDIO_QUEUE = read_int("WELCOME_MAX_AUDIO_QUEUE", 2, LOCAL_SETTINGS)
+WELCOME_ON_FIRST_DANMU = read_bool("WELCOME_ON_FIRST_DANMU", True, LOCAL_SETTINGS)
+WELCOME_DEBUG = read_bool("WELCOME_DEBUG", False, LOCAL_SETTINGS)
+AUDIO_SYNTH_WORKERS = max(read_int("AUDIO_SYNTH_WORKERS", 2, LOCAL_SETTINGS), 1)
+AUDIO_QUEUE_MAX_SIZE = max(read_int("AUDIO_QUEUE_MAX_SIZE", 24, LOCAL_SETTINGS), 4)
+MAX_KNOWN_USERS = max(read_int("MAX_KNOWN_USERS", 4000, LOCAL_SETTINGS), 500)
+USER_CACHE_TTL_SECONDS = max(read_float("USER_CACHE_TTL_SECONDS", 7200.0, LOCAL_SETTINGS), 60.0)
+MAX_RESOLVED_USER_NAMES = max(read_int("MAX_RESOLVED_USER_NAMES", 4000, LOCAL_SETTINGS), 500)
+MAX_FAILED_RESOLUTIONS = max(read_int("MAX_FAILED_RESOLUTIONS", 1000, LOCAL_SETTINGS), 100)
+OUTPUT_BUFFER_FLUSH_LINES = max(read_int("OUTPUT_BUFFER_FLUSH_LINES", 10, LOCAL_SETTINGS), 1)
+OUTPUT_BUFFER_FLUSH_SECONDS = max(
+    read_float("OUTPUT_BUFFER_FLUSH_SECONDS", 1.0, LOCAL_SETTINGS),
+    0.2,
+)
+SIDECAR_LOG_MAX_BYTES = max(read_int("SIDECAR_LOG_MAX_BYTES", 10 * 1024 * 1024, LOCAL_SETTINGS), 0)
+SIDECAR_LOG_BACKUPS = max(read_int("SIDECAR_LOG_BACKUPS", 3, LOCAL_SETTINGS), 1)
+MPV_VOLUME = read_float("MPV_VOLUME", 100.0, LOCAL_SETTINGS)
+MPV_AUDIO_DEVICE = read_str("MPV_AUDIO_DEVICE", "", LOCAL_SETTINGS)
+MPV_AF = read_str("MPV_AF", "", LOCAL_SETTINGS)
+HEARTBEAT_ENABLED = read_bool("HEARTBEAT_ENABLED", False, LOCAL_SETTINGS)
+HEARTBEAT_INTERVAL_SECONDS = max(
+    read_float("HEARTBEAT_INTERVAL_SECONDS", 180.0, LOCAL_SETTINGS),
+    30.0,
+)
+HEARTBEAT_MAX_AUDIO_QUEUE = max(read_int("HEARTBEAT_MAX_AUDIO_QUEUE", 1, LOCAL_SETTINGS), 0)
+SUBTITLE_AUTOSTART = read_bool("SUBTITLE_AUTOSTART", False, LOCAL_SETTINGS)
+SUBTITLE_SCRIPT_PATH = resolve_path(
+    read_str("SUBTITLE_SCRIPT_PATH", "live_subtitles.py", LOCAL_SETTINGS),
+    PROJECT_DIR,
+)
+SUBTITLE_LOG_PATH = resolve_path(
+    read_str("SUBTITLE_LOG_PATH", "live_subtitles.log", LOCAL_SETTINGS),
+    PROJECT_DIR,
+)
+SUBTITLE_OVERLAY_AUTOSTART = read_bool(
+    "SUBTITLE_OVERLAY_AUTOSTART",
+    False,
+    LOCAL_SETTINGS,
+)
+SUBTITLE_OVERLAY_SCRIPT_PATH = resolve_path(
+    read_str("SUBTITLE_OVERLAY_SCRIPT_PATH", "subtitle_overlay_server.py", LOCAL_SETTINGS),
+    PROJECT_DIR,
+)
+SUBTITLE_OVERLAY_LOG_PATH = resolve_path(
+    read_str("SUBTITLE_OVERLAY_LOG_PATH", "subtitle_overlay.log", LOCAL_SETTINGS),
+    PROJECT_DIR,
+)
+SUBTITLE_OVERLAY_HOST = read_str("SUBTITLE_OVERLAY_HOST", "127.0.0.1", LOCAL_SETTINGS)
+SUBTITLE_OVERLAY_PORT = max(read_int("SUBTITLE_OVERLAY_PORT", 18082, LOCAL_SETTINGS), 1)
+RESOLVE_MASKED_USER_NAMES = read_bool("RESOLVE_MASKED_USER_NAMES", True, LOCAL_SETTINGS)
 RESOLVE_USER_NAME_TIMEOUT_SECONDS = max(
-    _read_float("RESOLVE_USER_NAME_TIMEOUT_SECONDS", 3.0),
+    read_float("RESOLVE_USER_NAME_TIMEOUT_SECONDS", 3.0, LOCAL_SETTINGS),
     0.5,
 )
 HEARTBEAT_TEMPLATES = (
@@ -169,11 +160,30 @@ local_bot = SimpleChatBot(
     database_path="db.sqlite3",
 )
 bot = LLMChatBot(local_fallback=local_bot)
+_output_buffer: list[str] = []
+_last_output_flush = time.monotonic()
 
 
 def append_output(line: str) -> None:
+    global _last_output_flush
+    _output_buffer.append(line)
+    now = time.monotonic()
+    if (
+        len(_output_buffer) >= OUTPUT_BUFFER_FLUSH_LINES
+        or now - _last_output_flush >= OUTPUT_BUFFER_FLUSH_SECONDS
+    ):
+        flush_output()
+        _last_output_flush = now
+
+
+def flush_output() -> None:
+    if not _output_buffer:
+        return
+    OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
     with OUTPUT_PATH.open("a", encoding="utf-8") as file:
-        file.write(f"{line}\n")
+        for row in _output_buffer:
+            file.write(f"{row}\n")
+    _output_buffer.clear()
 
 
 def format_elapsed(seconds: float) -> str:
@@ -350,6 +360,30 @@ def build_heartbeat_text(index: int) -> str:
     return HEARTBEAT_TEMPLATES[index % len(HEARTBEAT_TEMPLATES)]
 
 
+def rotate_log_file(path: Path) -> None:
+    if SIDECAR_LOG_MAX_BYTES <= 0:
+        return
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return
+    if size < SIDECAR_LOG_MAX_BYTES:
+        return
+
+    oldest_backup = path.with_name(f"{path.name}.{SIDECAR_LOG_BACKUPS}")
+    with contextlib.suppress(OSError):
+        oldest_backup.unlink()
+    for index in range(SIDECAR_LOG_BACKUPS - 1, 0, -1):
+        source = path.with_name(f"{path.name}.{index}")
+        target = path.with_name(f"{path.name}.{index + 1}")
+        if source.exists():
+            with contextlib.suppress(OSError):
+                source.replace(target)
+    first_backup = path.with_name(f"{path.name}.1")
+    with contextlib.suppress(OSError):
+        path.replace(first_backup)
+
+
 def find_running_sidecar_pid(script_path: Path) -> int | None:
     if sys.platform != "win32":
         return None
@@ -427,6 +461,7 @@ def start_python_sidecar(
     stdout_target: Any = subprocess.DEVNULL
     stderr_target: Any = subprocess.DEVNULL
     try:
+        rotate_log_file(log_path)
         log_file = log_path.open("a", encoding="utf-8")
     except OSError as error:
         print(f"[{label}] log unavailable, starting without file log: {error}")
@@ -521,9 +556,12 @@ async def playback_worker(
     next_sequence = 1
     while True:
         async with prepared_condition:
-            await prepared_condition.wait_for(lambda: next_sequence in prepared_audio)
-            prepared_task = prepared_audio.pop(next_sequence)
-        next_sequence += 1
+            expected_sequence = next_sequence
+            await prepared_condition.wait_for(
+                lambda expected_sequence=expected_sequence: expected_sequence in prepared_audio
+            )
+            prepared_task = prepared_audio.pop(expected_sequence)
+        next_sequence = expected_sequence + 1
 
         task = prepared_task.task
         if prepared_task.audio_path is None:
@@ -575,7 +613,7 @@ async def run(
         room_id = int(input("请输入直播间编号: "))
 
     room = live.LiveDanmaku(room_id)
-    audio_queue: asyncio.Queue[AudioTask] = asyncio.Queue()
+    audio_queue: asyncio.Queue[AudioTask] = asyncio.Queue(maxsize=AUDIO_QUEUE_MAX_SIZE)
     prepared_audio: dict[int, PreparedAudioTask] = {}
     prepared_condition = asyncio.Condition()
     synth_tasks = [
@@ -585,7 +623,7 @@ async def run(
     playback_task = asyncio.create_task(playback_worker(prepared_audio, prepared_condition))
     last_welcome_time = 0.0
     last_welcome_by_user: dict[str, float] = {}
-    known_users_in_session: set[str] = set()
+    known_users_in_session: dict[str, float] = {}
     resolved_user_names: dict[str, str] = {}
     failed_user_name_resolutions: dict[str, float] = {}
     last_live_activity_at = time.monotonic()
@@ -644,7 +682,46 @@ async def run(
         nonlocal last_live_activity_at
         last_live_activity_at = time.monotonic() if at is None else at
 
+    def mark_user_seen(user_key: str) -> None:
+        now = time.monotonic()
+        known_users_in_session[user_key] = now
+        if (
+            len(known_users_in_session) > MAX_KNOWN_USERS
+            or len(resolved_user_names) > MAX_RESOLVED_USER_NAMES
+            or len(failed_user_name_resolutions) > MAX_FAILED_RESOLUTIONS
+        ):
+            prune_user_caches(now)
+
+    def prune_user_caches(now: float) -> None:
+        if len(known_users_in_session) > MAX_KNOWN_USERS:
+            user_cutoff = now - USER_CACHE_TTL_SECONDS
+            stale_users = [
+                key
+                for key, seen_at in known_users_in_session.items()
+                if seen_at < user_cutoff
+            ]
+            for key in stale_users:
+                known_users_in_session.pop(key, None)
+
+        if len(resolved_user_names) > MAX_RESOLVED_USER_NAMES:
+            removable_keys = list(resolved_user_names.keys())[
+                : len(resolved_user_names) - MAX_RESOLVED_USER_NAMES
+            ]
+            for key in removable_keys:
+                resolved_user_names.pop(key, None)
+
+        if len(failed_user_name_resolutions) > MAX_FAILED_RESOLUTIONS:
+            failed_cutoff = now - 300.0
+            stale_failed = [
+                key
+                for key, failed_at in failed_user_name_resolutions.items()
+                if failed_at < failed_cutoff
+            ]
+            for key in stale_failed:
+                failed_user_name_resolutions.pop(key, None)
+
     async def resolve_user_name(user_key: str, user_name: str) -> str:
+        prune_user_caches(time.monotonic())
         if not RESOLVE_MASKED_USER_NAMES:
             return user_name
         if not is_masked_user_name(user_name):
@@ -685,7 +762,13 @@ async def run(
         label: str,
         text: str,
         created_at: float,
-    ) -> None:
+    ) -> bool:
+        if audio_queue.full():
+            print(
+                f"[audio][drop] queue full ({audio_queue.qsize()}/{AUDIO_QUEUE_MAX_SIZE}) "
+                f"label={label}"
+            )
+            return False
         nonlocal audio_seq
         audio_seq += 1
         queued_at = time.perf_counter()
@@ -699,6 +782,7 @@ async def run(
                 queued_at=queued_at,
             )
         )
+        return True
 
     def prepare_welcome_user(
         user_key: str,
@@ -725,7 +809,7 @@ async def run(
             debug_welcome(f"skip queue_busy source={source} user={user_name}")
             return None
 
-        if len(last_welcome_by_user) > 200:
+        if len(last_welcome_by_user) > MAX_KNOWN_USERS:
             cutoff = now - WELCOME_USER_COOLDOWN_SECONDS
             stale_keys = [
                 key for key, timestamp in last_welcome_by_user.items() if timestamp < cutoff
@@ -737,7 +821,7 @@ async def run(
         welcome_text = build_welcome_text(spoken_user_name)
         last_welcome_time = now
         last_welcome_by_user[user_key] = now
-        known_users_in_session.add(user_key)
+        mark_user_seen(user_key)
         trace_id = next_trace_id("W")
 
         line = f"[欢迎{user_name}]：{welcome_text}"
@@ -766,13 +850,12 @@ async def run(
         welcome_task = prepare_welcome_user(user_key, user_name, source, started_at)
         if welcome_task is None:
             return False
-        await enqueue_audio(
+        return await enqueue_audio(
             welcome_task.trace_id,
             welcome_task.label,
             welcome_task.text,
             welcome_task.created_at,
         )
-        return True
 
     async def heartbeat_worker() -> None:
         nonlocal heartbeat_seq
@@ -812,7 +895,7 @@ async def run(
 
         pending_welcome: WelcomeTask | None = None
         if WELCOME_ON_FIRST_DANMU and user_key not in known_users_in_session:
-            known_users_in_session.add(user_key)
+            mark_user_seen(user_key)
             pending_welcome = prepare_welcome_user(
                 user_key,
                 display_user_name,
@@ -820,7 +903,7 @@ async def run(
                 started_at,
             )
         else:
-            known_users_in_session.add(user_key)
+            mark_user_seen(user_key)
 
         llm_started_at = time.perf_counter()
         response = await bot.get_response(content, user_key)
@@ -859,9 +942,10 @@ async def run(
         user_key, user_name = user_info
         display_user_name = await resolve_user_name(user_key, user_name)
         if user_key in known_users_in_session:
+            mark_user_seen(user_key)
             debug_welcome(f"skip known_user type={event.get('type')} user={display_user_name}")
             return
-        known_users_in_session.add(user_key)
+        mark_user_seen(user_key)
         await maybe_welcome_user(
             user_key,
             display_user_name,
@@ -897,6 +981,7 @@ async def run(
                 audio_file.unlink()
         await close_tts()
         await bot.aclose()
+        flush_output()
 
 
 def main() -> int:
@@ -904,6 +989,7 @@ def main() -> int:
         asyncio.run(run())
     except KeyboardInterrupt:
         print("\n已停止监听。")
+    flush_output()
     return 0
 
 

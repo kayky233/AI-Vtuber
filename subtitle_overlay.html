@@ -143,7 +143,7 @@
     <script>
       const params = new URLSearchParams(window.location.search);
       const pollInterval = Math.max(parseInt(params.get("interval") || "700", 10), 250);
-      const displayCount = Math.max(parseInt(params.get("count") || "2", 10), 1);
+      const displayCount = Math.max(parseInt(params.get("count") || "4", 10), 1);
       const mode = (params.get("mode") || "bilingual").toLowerCase();
       const stage = document.getElementById("stage");
       const statusNode = document.getElementById("status");

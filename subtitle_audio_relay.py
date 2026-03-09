@@ -5,36 +5,30 @@ import json
 import os
 from pathlib import Path
 import subprocess
-import sys
 import time
 from typing import Any
 
-try:
-    from local_settings import SETTINGS as LOCAL_SETTINGS
-except Exception:
-    LOCAL_SETTINGS: dict[str, Any] = {}
+from settings_utils import load_local_settings, read_str
+
+LOCAL_SETTINGS: dict[str, Any] = load_local_settings()
 
 
-def _read_setting(name: str) -> Any:
-    value = os.getenv(name)
-    if value is not None and value != "":
-        return value
-    return LOCAL_SETTINGS.get(name)
-
-
-def _read_str(name: str, default: str) -> str:
-    value = _read_setting(name)
-    if value is None:
-        return default
-    return str(value).strip()
-
-
-SOURCE_URL = _read_str("SUBTITLE_SOURCE_URL", "")
-MPV_PATH = _read_str("SUBTITLE_RELAY_MPV_PATH", str(Path("mpv.exe")))
-YTDLP_PATH = _read_str("SUBTITLE_RELAY_YTDLP_PATH", r"E:\KrillinAI-Kay\bin\yt-dlp.exe")
-RELAY_AUDIO_DEVICE = _read_str(
+SOURCE_URL = read_str("SUBTITLE_SOURCE_URL", "", LOCAL_SETTINGS)
+MPV_PATH = read_str("SUBTITLE_RELAY_MPV_PATH", str(Path("mpv.exe")), LOCAL_SETTINGS)
+YTDLP_PATH = read_str(
+    "SUBTITLE_RELAY_YTDLP_PATH",
+    r"E:\KrillinAI-Kay\bin\yt-dlp.exe",
+    LOCAL_SETTINGS,
+)
+SOURCE_FORMAT = read_str(
+    "SUBTITLE_SOURCE_FORMAT",
+    "worst[acodec!=none]/worst",
+    LOCAL_SETTINGS,
+)
+RELAY_AUDIO_DEVICE = read_str(
     "SUBTITLE_RELAY_AUDIO_DEVICE",
     "wasapi/{f9e303a0-b953-4cdf-abcc-e7a121ad7840}",
+    LOCAL_SETTINGS,
 )
 
 
@@ -74,7 +68,7 @@ def resolve_media_url(source_url: str) -> str:
     if not Path(YTDLP_PATH).exists():
         return source_url
 
-    command = [YTDLP_PATH, "-g", "-f", "bestaudio/best", source_url]
+    command = [YTDLP_PATH, "-g", "-f", SOURCE_FORMAT, source_url]
     result = subprocess.run(
         command,
         capture_output=True,
@@ -121,7 +115,7 @@ def run() -> int:
             time.sleep(5)
             continue
 
-        print(f"[relay] starting playback")
+        print("[relay] starting playback")
         started_at = time.monotonic()
         process = subprocess.Popen(
             build_mpv_command(media_url),

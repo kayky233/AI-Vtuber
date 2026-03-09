@@ -17,9 +17,17 @@ SETTINGS = {
     "EDGE_TTS_RATE": "+2%",
     "EDGE_TTS_PITCH": "-2Hz",
     "EDGE_TTS_VOLUME": "+0%",
+    "EDGE_TTS_TIMEOUT_SECONDS": 25,
 
     # Player / misc
     "MPV_AUDIO_DEVICE": "",
+    "AUDIO_QUEUE_MAX_SIZE": 24,
+    "MAX_KNOWN_USERS": 4000,
+    "USER_CACHE_TTL_SECONDS": 7200,
+    "MAX_RESOLVED_USER_NAMES": 4000,
+    "MAX_FAILED_RESOLUTIONS": 1000,
+    "SIDECAR_LOG_MAX_BYTES": 10485760,
+    "SIDECAR_LOG_BACKUPS": 3,
     "HEARTBEAT_ENABLED": True,
     "HEARTBEAT_INTERVAL_SECONDS": 180,
 
@@ -65,7 +73,14 @@ SETTINGS = {
     "SUBTITLE_OVERLAY_LOG_PATH": "subtitle_overlay.log",
     "SUBTITLE_OVERLAY_HOST": "127.0.0.1",
     "SUBTITLE_OVERLAY_PORT": 18082,
+    # Preferred: put your URL in this text file (first non-empty line).
+    # The sidecar can hot-switch when this file changes.
+    "SUBTITLE_SOURCE_URL_FILE": "subtitle_source_url.txt",
+    "SUBTITLE_SOURCE_URL_RELOAD_SECONDS": 2.0,
+    # Fallback URL when SUBTITLE_SOURCE_URL_FILE is missing/empty.
     "SUBTITLE_SOURCE_URL": "https://www.youtube.com/watch?v=YOUR_SOURCE_ID",
+    # For source-url capture: prefer low bitrate formats with audio.
+    "SUBTITLE_SOURCE_FORMAT": "worst[acodec!=none]/worst",
     "SUBTITLE_RELAY_AUDIO_DEVICE": "",
     "SUBTITLE_RELAY_YTDLP_PATH": r"E:\path\to\yt-dlp.exe",
     "SUBTITLE_OUTPUT_PATH": "live_subtitle.txt",

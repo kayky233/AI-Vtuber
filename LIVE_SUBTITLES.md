@@ -6,7 +6,7 @@ This repository now includes a complete live subtitle sidecar for external video
 
 Current default flow:
 
-1. Pull audio directly from `SUBTITLE_SOURCE_URL` with `ffmpeg`
+1. Pull audio directly from `SUBTITLE_SOURCE_URL_FILE` (preferred) or `SUBTITLE_SOURCE_URL` with `ffmpeg`
 2. Segment the stream into short WAV chunks
 3. Run persistent in-process ASR with `faster-whisper`
 4. Translate Japanese subtitles to Simplified Chinese asynchronously
@@ -30,7 +30,7 @@ The current implementation is tuned for low-latency Japanese-to-Chinese subtitle
 ## Runtime Architecture
 
 ```text
-SUBTITLE_SOURCE_URL
+SUBTITLE_SOURCE_URL_FILE / SUBTITLE_SOURCE_URL
   -> ffmpeg segment capture
   -> tmp_subtitles/chunks/chunk_xxxxxx.wav
   -> audio preparation / normalization
@@ -115,8 +115,22 @@ The current local defaults are:
 "SUBTITLE_TRANSLATION_MAX_TOKENS": 32,
 "SUBTITLE_TRANSLATION_PENDING_LIMIT": 3,
 "SUBTITLE_TRANSLATION_WORKERS": 3,
-"SUBTITLE_SOURCE_URL": "https://www.youtube.com/watch?v=p39l_mrM7Pk",
+"SUBTITLE_SOURCE_URL_FILE": "subtitle_source_url.txt",
+"SUBTITLE_SOURCE_URL_RELOAD_SECONDS": 2.0,
+"SUBTITLE_SOURCE_URL": "https://www.youtube.com/watch?v=YOUR_SOURCE_ID",
+"SUBTITLE_SOURCE_FORMAT": "worst[acodec!=none]/worst",
 ```
+
+### Source URL Switching (No Hardcode)
+
+- Preferred:
+  - keep stream URL in `subtitle_source_url.txt`
+  - first non-empty line is used
+- Runtime hot-switch:
+  - edit `subtitle_source_url.txt` while `live_subtitles.py` is running
+  - sidecar auto-detects change and reconnects
+- Fallback:
+  - if file is missing/empty, `SUBTITLE_SOURCE_URL` is used
 
 ## Reliability Features
 
@@ -175,11 +189,11 @@ Overlay server:
 Recommended OBS browser-source URLs:
 
 - bilingual:
-  - `http://127.0.0.1:18082/subtitle_overlay.html?mode=bilingual&count=2&interval=400`
+  - `http://127.0.0.1:18082/subtitle_overlay.html?mode=bilingual&count=4&interval=400`
 - translated only:
-  - `http://127.0.0.1:18082/subtitle_overlay.html?mode=translated&count=2&interval=400`
+  - `http://127.0.0.1:18082/subtitle_overlay.html?mode=translated&count=4&interval=400`
 - origin only:
-  - `http://127.0.0.1:18082/subtitle_overlay.html?mode=origin&count=2&interval=400`
+  - `http://127.0.0.1:18082/subtitle_overlay.html?mode=origin&count=4&interval=400`
 
 For live streaming, `mode=translated` usually gives the best viewer experience.
 
@@ -195,6 +209,18 @@ python .\main.py
 
 ```powershell
 python -u .\live_subtitles.py
+```
+
+### Subtitle sidecar with one-off URL override
+
+```powershell
+python -u .\live_subtitles.py --source-url "https://www.youtube.com/watch?v=VIDEO_ID"
+```
+
+### Subtitle sidecar with one-off URL file override
+
+```powershell
+python -u .\live_subtitles.py --source-url-file ".\subtitle_source_url.txt"
 ```
 
 ### Overlay only

@@ -12,7 +12,7 @@ import subprocess
 import sys
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Callable
 import warnings
 import wave
@@ -21,12 +21,18 @@ import httpx
 import numpy as np
 
 from llm_bot import _build_providers, _extract_error_text, _extract_text
+from settings_utils import (
+    load_local_settings,
+    read_bool as _shared_read_bool,
+    read_float as _shared_read_float,
+    read_int as _shared_read_int,
+    read_setting as _shared_read_setting,
+    read_str as _shared_read_str,
+    resolve_path as _shared_resolve_path,
+)
 from subtitle_audio_relay import discover_livehime_browser_source_url, resolve_media_url
 
-try:
-    from local_settings import SETTINGS as LOCAL_SETTINGS
-except Exception:
-    LOCAL_SETTINGS: dict[str, Any] = {}
+LOCAL_SETTINGS: dict[str, Any] = load_local_settings()
 
 try:
     _original_fromstring = np.fromstring
@@ -54,54 +60,34 @@ except Exception:
 
 PROJECT_DIR = Path(__file__).resolve().parent
 TIMESTAMP_LINE_RE = re.compile(r"^\[(\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]$")
+HTTP_ERROR_THRESHOLD = 400
+WAV_HEADER_BYTES = 44
+CHUNK_SETTLE_SECONDS = 1.5
+MAX_TRANSLATION_ATTEMPTS = 4
 
 
 def _read_setting(name: str) -> Any:
-    value = os.getenv(name)
-    if value is not None and value != "":
-        return value
-    return LOCAL_SETTINGS.get(name)
+    return _shared_read_setting(name, LOCAL_SETTINGS)
 
 
 def _read_str(name: str, default: str) -> str:
-    value = _read_setting(name)
-    if value is None:
-        return default
-    return str(value).strip()
+    return _shared_read_str(name, default, LOCAL_SETTINGS)
 
 
 def _read_bool(name: str, default: bool) -> bool:
-    value = _read_setting(name)
-    if value is None:
-        return default
-    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+    return _shared_read_bool(name, default, LOCAL_SETTINGS)
 
 
 def _read_int(name: str, default: int) -> int:
-    value = _read_setting(name)
-    if value in (None, ""):
-        return default
-    try:
-        return int(value)
-    except ValueError:
-        return default
+    return _shared_read_int(name, default, LOCAL_SETTINGS)
 
 
 def _read_float(name: str, default: float) -> float:
-    value = _read_setting(name)
-    if value in (None, ""):
-        return default
-    try:
-        return float(value)
-    except ValueError:
-        return default
+    return _shared_read_float(name, default, LOCAL_SETTINGS)
 
 
 def _resolve_path(raw_path: str) -> Path:
-    path = Path(raw_path)
-    if path.is_absolute():
-        return path
-    return PROJECT_DIR / path
+    return _shared_resolve_path(raw_path, PROJECT_DIR)
 
 
 @dataclass(frozen=True)
@@ -129,6 +115,8 @@ class SubtitleConfig:
     origin_output_path: Path
     translated_output_path: Path
     source_url: str
+    source_url_file: Path | None
+    source_url_reload_seconds: float
     translation_timeout_seconds: float
     transcribe_timeout_seconds: float
     translation_max_tokens: int
@@ -174,6 +162,15 @@ class TranslationResult:
     text: str
 
 
+@dataclass
+class TranslationMetrics:
+    submitted: int = 0
+    dropped: int = 0
+    success: int = 0
+    failed: int = 0
+    retried: int = 0
+
+
 @dataclass(frozen=True)
 class PreparedChunk:
     chunk_index: int
@@ -190,6 +187,7 @@ class AudioCaptureHandle:
         self.error_text = ""
         self.exit_code: int | None = None
         self.source_name = ""
+        self.source_origin = ""
 
     def poll(self) -> int | None:
         if self.process is not None:
@@ -225,6 +223,8 @@ def load_config() -> SubtitleConfig:
     work_dir = _resolve_path(_read_str("SUBTITLE_WORK_DIR", "tmp_subtitles"))
     chunks_dir = work_dir / "chunks"
     default_backend = "soundcard_loopback" if sc is not None else "ffmpeg_dshow"
+    source_url_file_raw = _read_str("SUBTITLE_SOURCE_URL_FILE", "").strip()
+    source_url_file = _resolve_path(source_url_file_raw) if source_url_file_raw else None
     return SubtitleConfig(
         asr_backend=_read_str(
             "SUBTITLE_ASR_BACKEND",
@@ -274,6 +274,11 @@ def load_config() -> SubtitleConfig:
             _read_str("SUBTITLE_TRANSLATED_OUTPUT_PATH", "live_subtitle_translated.txt")
         ),
         source_url=_read_str("SUBTITLE_SOURCE_URL", ""),
+        source_url_file=source_url_file,
+        source_url_reload_seconds=max(
+            _read_float("SUBTITLE_SOURCE_URL_RELOAD_SECONDS", 2.0),
+            0.5,
+        ),
         translation_timeout_seconds=max(
             _read_float("SUBTITLE_TRANSLATION_TIMEOUT_SECONDS", 6.0),
             1.0,
@@ -316,6 +321,10 @@ def _sort_providers(
         return []
 
     order_index = {name: index for index, name in enumerate(preferred_order)}
+    if order_index:
+        filtered = [provider for provider in providers if provider.name in order_index]
+        if filtered:
+            providers = filtered
     return sorted(
         providers,
         key=lambda provider: (
@@ -489,7 +498,7 @@ class SubtitleTranslator:
                 self._mark_provider_failure(provider.name)
                 last_error = str(error)
                 continue
-            if response.status_code >= 400:
+            if response.status_code >= HTTP_ERROR_THRESHOLD:
                 self._mark_provider_failure(provider.name)
                 last_error = _extract_error_text(response)
                 continue
@@ -680,22 +689,18 @@ def cleanup_stale_worker_processes(config: SubtitleConfig) -> None:
     if os.name != "nt":
         return
 
-    chunk_target = str(config.chunks_dir / "chunk_%06d.wav").replace("'", "''")
-    prepared_target = str((config.work_dir / "prepared")).replace("'", "''")
-    script = f"""
-$patterns = @('{chunk_target}', '{prepared_target}')
-$names = @('ffmpeg.exe', 'faster-whisper-xxl.exe')
-$procs = Get-CimInstance Win32_Process | Where-Object {{
-    $cmd = [string]$_.CommandLine
-    ($_.Name -in $names) -and (($patterns | Where-Object {{ $cmd -like "*$_*" }}).Count -gt 0)
-}}
-foreach ($proc in $procs) {{
-    try {{
-        Stop-Process -Id $proc.ProcessId -Force -ErrorAction Stop
-        Write-Output ("[subtitle][cleanup] killed {0} pid={1}" -f $proc.Name, $proc.ProcessId)
-    }} catch {{
-    }}
-}}
+    script = """
+$names = @('ffmpeg', 'faster-whisper-xxl')
+foreach ($name in $names) {
+    $procs = Get-Process -Name $name -ErrorAction SilentlyContinue
+    foreach ($proc in $procs) {
+        try {
+            Stop-Process -Id $proc.Id -Force -ErrorAction Stop
+            Write-Output ("[subtitle][cleanup] killed {0} pid={1}" -f $proc.ProcessName, $proc.Id)
+        } catch {
+        }
+    }
+}
 """
     try:
         result = subprocess.run(
@@ -709,7 +714,7 @@ foreach ($proc in $procs) {{
             ],
             capture_output=True,
             text=True,
-            timeout=20,
+            timeout=12,
         )
     except Exception as error:
         print(f"[subtitle][cleanup] failed: {error}")
@@ -893,9 +898,47 @@ def start_ffmpeg_capture(config: SubtitleConfig) -> AudioCaptureHandle:
     return handle
 
 
+def _read_source_url_from_file(source_url_file: Path | None) -> str:
+    if source_url_file is None:
+        return ""
+    try:
+        content = source_url_file.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return ""
+    except Exception:
+        return ""
+    content = content.lstrip("\ufeff")
+    for raw_line in content.splitlines():
+        line = raw_line.strip().lstrip("\ufeff")
+        if not line or line.startswith("#"):
+            continue
+        return line.strip("\"'")
+    return ""
+
+
+def resolve_capture_source_url(
+    config: SubtitleConfig,
+    *,
+    allow_discovery: bool,
+) -> tuple[str, str]:
+    file_url = _read_source_url_from_file(config.source_url_file)
+    if file_url:
+        return file_url, "source_url_file"
+
+    static_url = config.source_url.strip()
+    if static_url:
+        return static_url, "source_url_setting"
+
+    if allow_discovery:
+        discovered_url = discover_livehime_browser_source_url()
+        if discovered_url:
+            return discovered_url, "livehime_discovery"
+    return "", ""
+
+
 def start_source_url_capture(config: SubtitleConfig) -> AudioCaptureHandle:
     handle = AudioCaptureHandle()
-    source_url = config.source_url or discover_livehime_browser_source_url()
+    source_url, source_origin = resolve_capture_source_url(config, allow_discovery=True)
     if not source_url:
         handle.error_text = "no subtitle source url found"
         handle.exit_code = 1
@@ -908,6 +951,7 @@ def start_source_url_capture(config: SubtitleConfig) -> AudioCaptureHandle:
         return handle
 
     handle.source_name = source_url
+    handle.source_origin = source_origin
     output_pattern = str(config.chunks_dir / "chunk_%06d.wav")
     command = [
         str(config.ffmpeg_path),
@@ -1313,7 +1357,7 @@ def prepare_chunk_audio(config: SubtitleConfig, audio_path: Path) -> Path | None
             return None
 
     try:
-        if prepared_path.stat().st_size <= 44:
+        if prepared_path.stat().st_size <= WAV_HEADER_BYTES:
             with contextlib.suppress(OSError):
                 prepared_path.unlink()
             return None
@@ -1328,6 +1372,53 @@ def parse_chunk_index(path: Path) -> int:
         return int(path.stem.split("_")[-1])
     except (TypeError, ValueError):
         return 0
+
+
+@dataclass
+class ChunkCollector:
+    next_index: int = 0
+    last_rescan_at: float = 0.0
+    rescan_interval_seconds: float = 4.0
+
+    def reset(self) -> None:
+        self.next_index = 0
+        self.last_rescan_at = 0.0
+
+    def collect_candidates(
+        self,
+        chunks_dir: Path,
+        retry_after: dict[str, float],
+    ) -> list[Path]:
+        now = time.time()
+        candidates: list[Path] = []
+
+        while True:
+            path = chunks_dir / f"chunk_{self.next_index:06d}.wav"
+            if not path.exists():
+                break
+            if retry_after.get(path.name, 0.0) > now:
+                break
+            candidates.append(path)
+            self.next_index += 1
+
+        if candidates:
+            return candidates
+
+        if now - self.last_rescan_at < self.rescan_interval_seconds:
+            return []
+
+        self.last_rescan_at = now
+        for path in sorted(chunks_dir.glob("chunk_*.wav")):
+            if retry_after.get(path.name, 0.0) > now:
+                continue
+            chunk_index = parse_chunk_index(path)
+            if chunk_index < self.next_index:
+                continue
+            if chunk_index > self.next_index:
+                break
+            candidates.append(path)
+            self.next_index = chunk_index + 1
+        return candidates
 
 
 def merge_prepared_chunks(
@@ -1593,6 +1684,73 @@ def measure_audio_level(audio_path: Path) -> tuple[float, float] | None:
     return peak, rms
 
 
+def translation_retry_delay(attempt: int) -> float:
+    normalized_attempt = max(attempt, 1)
+    return min(0.8 * (2 ** (normalized_attempt - 1)), 8.0)
+
+
+def transcribe_window_incremental(
+    config: SubtitleConfig,
+    asr_transcriber: SubtitleAsrTranscriber,
+    window_chunks: list[PreparedChunk],
+    *,
+    direct_chunk_mode: bool,
+    last_origin_text: str,
+    last_emitted_segment_end: float,
+) -> tuple[TranscriptionResult, str, float]:
+    if direct_chunk_mode:
+        active_chunk = window_chunks[-1]
+        result = asr_transcriber.transcribe(
+            active_chunk.prepared_path,
+            chunk_length_seconds=config.segment_seconds,
+        )
+        return result, polish_subtitle_text(result.text), last_emitted_segment_end
+
+    window_audio_path = merge_prepared_chunks(
+        config,
+        window_chunks,
+        window_chunks[-1].chunk_index,
+    )
+    if window_audio_path is None:
+        return TranscriptionResult(text="", ok=False, segments=()), "", last_emitted_segment_end
+
+    result = asr_transcriber.transcribe(
+        window_audio_path,
+        chunk_length_seconds=config.recognition_window_seconds,
+    )
+    cleanup_chunk_files(window_audio_path)
+    window_start_seconds = max(window_chunks[0].chunk_index, 0) * float(config.segment_seconds)
+    window_end_seconds = (max(window_chunks[-1].chunk_index, 0) + 1) * float(
+        config.segment_seconds
+    )
+    stable_cutoff_seconds = max(
+        window_start_seconds,
+        window_end_seconds - config.recognition_holdback_seconds,
+    )
+    emitted_texts: list[str] = []
+    emitted_end_time = last_emitted_segment_end
+    for segment in result.segments:
+        segment_text = normalize_transcript_text(segment.text)
+        if not segment_text:
+            continue
+        global_end = window_start_seconds + max(segment.end, segment.start)
+        if global_end <= last_emitted_segment_end + 0.05:
+            continue
+        if global_end > stable_cutoff_seconds:
+            continue
+        emitted_texts.append(segment_text)
+        emitted_end_time = max(emitted_end_time, global_end)
+
+    incremental_text = polish_subtitle_text(" ".join(emitted_texts))
+    if not incremental_text and result.text.strip():
+        fallback_text = polish_subtitle_text(result.text)
+        incremental_text = extract_incremental_text(last_origin_text, fallback_text)
+        if not incremental_text and fallback_text != last_origin_text:
+            incremental_text = fallback_text
+
+    return result, incremental_text, emitted_end_time
+
+
 def run(config: SubtitleConfig) -> int:
     if not validate_config(config):
         return 2
@@ -1605,6 +1763,7 @@ def run(config: SubtitleConfig) -> int:
     translator = SubtitleTranslator(config)
     capture_handle = start_audio_capture(config)
     processed_files: set[str] = set()
+    chunk_collector = ChunkCollector()
     entries = read_subtitle_entries(config)
     state_lock = threading.Lock()
     window_chunk_limit = max(
@@ -1624,9 +1783,11 @@ def run(config: SubtitleConfig) -> int:
     window_chunks: list[PreparedChunk] = []
     translation_attempts: dict[int, int] = {}
     translation_retry_after: dict[int, float] = {}
-    max_translation_attempts = 4
+    translation_metrics = TranslationMetrics()
+    last_translation_metrics_at = time.time()
     last_capture_activity = time.time()
     last_capture_restart_at = 0.0
+    last_source_reload_check_at = 0.0
 
     def restart_capture(reason: str) -> None:
         nonlocal capture_handle
@@ -1643,6 +1804,7 @@ def run(config: SubtitleConfig) -> int:
         for chunk in window_chunks:
             cleanup_chunk_files(chunk.prepared_path)
         processed_files.clear()
+        chunk_collector.reset()
         retry_after.clear()
         window_chunks.clear()
         last_emitted_segment_end = 0.0
@@ -1651,13 +1813,35 @@ def run(config: SubtitleConfig) -> int:
         last_capture_restart_at = last_capture_activity
         if capture_handle.source_name:
             print(f"[subtitle][capture] resumed source: {capture_handle.source_name}")
+            if capture_handle.source_origin:
+                print(
+                    f"[subtitle][capture] resumed source mode: {capture_handle.source_origin}"
+                )
+
+    def submit_translation(entry_id: int, origin_text: str) -> bool:
+        attempts = translation_attempts.get(entry_id, 0)
+        if attempts >= MAX_TRANSLATION_ATTEMPTS:
+            return False
+        if not translation_dispatcher.submit(entry_id, origin_text):
+            translation_metrics.dropped += 1
+            return False
+        attempts += 1
+        translation_attempts[entry_id] = attempts
+        translation_retry_after[entry_id] = time.time() + translation_retry_delay(attempts)
+        translation_metrics.submitted += 1
+        if attempts > 1:
+            translation_metrics.retried += 1
+        return True
 
     def apply_translation_result(result: TranslationResult) -> None:
         translated_text = result.text.strip()
         if not translated_text:
+            translation_metrics.failed += 1
             attempts = translation_attempts.get(result.entry_id, 1)
-            if attempts < max_translation_attempts:
-                translation_retry_after[result.entry_id] = time.time() + 1.0
+            if attempts < MAX_TRANSLATION_ATTEMPTS:
+                translation_retry_after[result.entry_id] = time.time() + translation_retry_delay(
+                    attempts + 1
+                )
             return
 
         with state_lock:
@@ -1675,6 +1859,7 @@ def run(config: SubtitleConfig) -> int:
 
         translation_attempts.pop(result.entry_id, None)
         translation_retry_after.pop(result.entry_id, None)
+        translation_metrics.success += 1
         timestamp_text = ""
         for entry in entries:
             if entry.entry_id == result.entry_id:
@@ -1700,8 +1885,12 @@ def run(config: SubtitleConfig) -> int:
         write_entry_outputs(config, entries)
 
     print(f"[subtitle] capture backend: {config.capture_backend}")
+    if config.source_url_file is not None:
+        print(f"[subtitle] source url file: {config.source_url_file}")
     if capture_handle.source_name:
         print(f"[subtitle] capture source: {capture_handle.source_name}")
+        if capture_handle.source_origin:
+            print(f"[subtitle] capture source mode: {capture_handle.source_origin}")
     print(f"[subtitle] output file: {config.output_path}")
     print(f"[subtitle][asr] backend: {asr_transcriber.describe()}")
     print(
@@ -1723,11 +1912,7 @@ def run(config: SubtitleConfig) -> int:
         )
         for entry in entries:
             if entry.origin.strip() and not entry.translated.strip():
-                if translation_dispatcher.submit(entry.entry_id, entry.origin):
-                    translation_attempts[entry.entry_id] = (
-                        translation_attempts.get(entry.entry_id, 0) + 1
-                    )
-                    translation_retry_after[entry.entry_id] = time.time() + 1.0
+                submit_translation(entry.entry_id, entry.origin)
 
     try:
         while True:
@@ -1744,6 +1929,24 @@ def run(config: SubtitleConfig) -> int:
                     time.sleep(1.0)
                     continue
 
+            if (
+                config.capture_backend == "ffmpeg_source_url"
+                and config.source_url_file is not None
+                and now - last_source_reload_check_at >= config.source_url_reload_seconds
+            ):
+                last_source_reload_check_at = now
+                target_source_url, _ = resolve_capture_source_url(
+                    config,
+                    allow_discovery=False,
+                )
+                if target_source_url and target_source_url != capture_handle.source_name:
+                    restart_capture(
+                        "source url changed "
+                        f"({capture_handle.source_name} -> {target_source_url})"
+                    )
+                    time.sleep(1.0)
+                    continue
+
             window_dirty = False
             latest_chunk_mtime = 0.0
             for audio_path in sorted(config.chunks_dir.glob("chunk_*.wav")):
@@ -1756,10 +1959,10 @@ def run(config: SubtitleConfig) -> int:
                 except FileNotFoundError:
                     continue
                 latest_chunk_mtime = max(latest_chunk_mtime, stat.st_mtime)
-                if stat.st_size <= 44:
-                    retry_after[audio_path.name] = time.time() + 1.5
+                if stat.st_size <= WAV_HEADER_BYTES:
+                    retry_after[audio_path.name] = time.time() + CHUNK_SETTLE_SECONDS
                     continue
-                if time.time() - stat.st_mtime < 1.5:
+                if time.time() - stat.st_mtime < CHUNK_SETTLE_SECONDS:
                     continue
 
                 prepared_audio_path = prepare_chunk_audio(config, audio_path)
@@ -1777,6 +1980,10 @@ def run(config: SubtitleConfig) -> int:
                             f"[subtitle][silent] {audio_path.name} peak={peak:.4f} rms={rms:.4f}"
                         )
                 processed_files.add(audio_path.name)
+                if len(processed_files) > 20_000:
+                    processed_files = set(
+                        sorted(processed_files)[-10_000:]
+                    )
                 retry_after.pop(audio_path.name, None)
                 cleanup_chunk_files(audio_path)
                 last_capture_activity = max(last_capture_activity, time.time(), stat.st_mtime)
@@ -1800,62 +2007,14 @@ def run(config: SubtitleConfig) -> int:
                     time.sleep(0.2)
                     continue
 
-                if direct_chunk_mode:
-                    active_chunk = window_chunks[-1]
-                    result = asr_transcriber.transcribe(
-                        active_chunk.prepared_path,
-                        chunk_length_seconds=config.segment_seconds,
-                    )
-                    incremental_text = polish_subtitle_text(result.text)
-                else:
-                    window_audio_path = merge_prepared_chunks(
-                        config,
-                        window_chunks,
-                        window_chunks[-1].chunk_index,
-                    )
-                    if window_audio_path is None:
-                        time.sleep(0.2)
-                        continue
-
-                    result = asr_transcriber.transcribe(
-                        window_audio_path,
-                        chunk_length_seconds=config.recognition_window_seconds,
-                    )
-                    cleanup_chunk_files(window_audio_path)
-                    window_start_seconds = max(window_chunks[0].chunk_index, 0) * float(
-                        config.segment_seconds
-                    )
-                    window_end_seconds = (
-                        max(window_chunks[-1].chunk_index, 0) + 1
-                    ) * float(config.segment_seconds)
-                    stable_cutoff_seconds = max(
-                        window_start_seconds,
-                        window_end_seconds - config.recognition_holdback_seconds,
-                    )
-                    emitted_texts: list[str] = []
-                    emitted_end_time = last_emitted_segment_end
-                    for segment in result.segments:
-                        segment_text = normalize_transcript_text(segment.text)
-                        if not segment_text:
-                            continue
-                        global_end = window_start_seconds + max(segment.end, segment.start)
-                        if global_end <= last_emitted_segment_end + 0.05:
-                            continue
-                        if global_end > stable_cutoff_seconds:
-                            continue
-                        emitted_texts.append(segment_text)
-                        emitted_end_time = max(emitted_end_time, global_end)
-
-                    incremental_text = polish_subtitle_text(" ".join(emitted_texts))
-                    last_emitted_segment_end = emitted_end_time
-                    if not incremental_text and result.text.strip():
-                        fallback_text = polish_subtitle_text(result.text)
-                        incremental_text = extract_incremental_text(
-                            last_origin_text,
-                            fallback_text,
-                        )
-                        if not incremental_text and fallback_text != last_origin_text:
-                            incremental_text = fallback_text
+                result, incremental_text, last_emitted_segment_end = transcribe_window_incremental(
+                    config,
+                    asr_transcriber,
+                    window_chunks,
+                    direct_chunk_mode=direct_chunk_mode,
+                    last_origin_text=last_origin_text,
+                    last_emitted_segment_end=last_emitted_segment_end,
+                )
 
                 if not result.ok:
                     latest_chunk_name = window_chunks[-1].name if window_chunks else "unknown"
@@ -1889,11 +2048,7 @@ def run(config: SubtitleConfig) -> int:
                 print(f"[subtitle][{entry.timestamp_text}] {incremental_text}")
 
                 if config.translate_to_zh:
-                    if translation_dispatcher.submit(entry.entry_id, incremental_text):
-                        translation_attempts[entry.entry_id] = (
-                            translation_attempts.get(entry.entry_id, 0) + 1
-                        )
-                        translation_retry_after[entry.entry_id] = time.time() + 1.0
+                    submit_translation(entry.entry_id, incremental_text)
 
             if config.translate_to_zh and translation_dispatcher.enabled:
                 now = time.time()
@@ -1901,13 +2056,22 @@ def run(config: SubtitleConfig) -> int:
                     if not entry.origin.strip() or entry.translated.strip():
                         continue
                     attempts = translation_attempts.get(entry.entry_id, 0)
-                    if attempts >= max_translation_attempts:
+                    if attempts >= MAX_TRANSLATION_ATTEMPTS:
                         continue
                     if translation_retry_after.get(entry.entry_id, 0.0) > now:
                         continue
-                    if translation_dispatcher.submit(entry.entry_id, entry.origin):
-                        translation_attempts[entry.entry_id] = attempts + 1
-                        translation_retry_after[entry.entry_id] = now + 1.2
+                    submit_translation(entry.entry_id, entry.origin)
+
+            if config.translate_to_zh and time.time() - last_translation_metrics_at >= 30.0:
+                print(
+                    "[subtitle][translate][stats] "
+                    f"submitted={translation_metrics.submitted} "
+                    f"success={translation_metrics.success} "
+                    f"failed={translation_metrics.failed} "
+                    f"retried={translation_metrics.retried} "
+                    f"dropped={translation_metrics.dropped}"
+                )
+                last_translation_metrics_at = time.time()
 
             if latest_chunk_mtime > 0:
                 last_capture_activity = max(last_capture_activity, latest_chunk_mtime)
@@ -1927,6 +2091,15 @@ def run(config: SubtitleConfig) -> int:
         print("\n[subtitle] stopped")
         return 0
     finally:
+        if config.translate_to_zh:
+            print(
+                "[subtitle][translate][final] "
+                f"submitted={translation_metrics.submitted} "
+                f"success={translation_metrics.success} "
+                f"failed={translation_metrics.failed} "
+                f"retried={translation_metrics.retried} "
+                f"dropped={translation_metrics.dropped}"
+            )
         asr_transcriber.close()
         translation_dispatcher.close()
         translator.close()
@@ -1941,9 +2114,25 @@ def main() -> int:
         action="store_true",
         help="List available capture devices and exit.",
     )
+    parser.add_argument(
+        "--source-url",
+        default="",
+        help="Override subtitle source URL for this run only.",
+    )
+    parser.add_argument(
+        "--source-url-file",
+        default="",
+        help="Read subtitle source URL from this text file (first non-empty line).",
+    )
     args = parser.parse_args()
 
     config = load_config()
+    source_url_file = str(args.source_url_file or "").strip()
+    source_url = str(args.source_url or "").strip()
+    if source_url_file:
+        config = replace(config, source_url_file=_resolve_path(source_url_file))
+    if source_url:
+        config = replace(config, source_url=source_url)
     if args.list_devices:
         return list_audio_devices(config)
     return run(config)

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import os
 from pathlib import Path
 import re
 import subprocess
@@ -10,41 +9,9 @@ from typing import Any
 
 import httpx
 
-try:
-    from local_settings import SETTINGS as LOCAL_SETTINGS
-except Exception:
-    LOCAL_SETTINGS: dict[str, Any] = {}
+from settings_utils import load_local_settings, read_bool, read_int, read_str
 
-
-def _read_setting(name: str) -> Any:
-    value = os.getenv(name)
-    if value is not None and value != "":
-        return value
-    return LOCAL_SETTINGS.get(name)
-
-
-def _read_str(name: str, default: str) -> str:
-    value = _read_setting(name)
-    if value is None:
-        return default
-    return str(value).strip()
-
-
-def _read_bool(name: str, default: bool) -> bool:
-    value = _read_setting(name)
-    if value is None:
-        return default
-    return str(value).strip().lower() in {"1", "true", "yes", "on"}
-
-
-def _read_int(name: str, default: int) -> int:
-    value = _read_setting(name)
-    if value in (None, ""):
-        return default
-    try:
-        return int(value)
-    except ValueError:
-        return default
+LOCAL_SETTINGS: dict[str, Any] = load_local_settings()
 
 
 def _extract_uuid_or_raw(value: str) -> str:
@@ -59,29 +26,32 @@ def _extract_uuid_or_raw(value: str) -> str:
         return match.group(1)
     return value
 
-TTS_PROVIDER = _read_str("TTS_PROVIDER", "edge").lower()
+TTS_PROVIDER = read_str("TTS_PROVIDER", "edge", LOCAL_SETTINGS).lower()
 
-EDGE_TTS_VOICE = _read_str("EDGE_TTS_VOICE", "zh-CN-XiaoyiNeural")
-EDGE_TTS_RATE = _read_str("EDGE_TTS_RATE", "+0%")
-EDGE_TTS_PITCH = _read_str("EDGE_TTS_PITCH", "-1Hz")
-EDGE_TTS_VOLUME = _read_str("EDGE_TTS_VOLUME", "+0%")
+EDGE_TTS_VOICE = read_str("EDGE_TTS_VOICE", "zh-CN-XiaoyiNeural", LOCAL_SETTINGS)
+EDGE_TTS_RATE = read_str("EDGE_TTS_RATE", "+0%", LOCAL_SETTINGS)
+EDGE_TTS_PITCH = read_str("EDGE_TTS_PITCH", "-1Hz", LOCAL_SETTINGS)
+EDGE_TTS_VOLUME = read_str("EDGE_TTS_VOLUME", "+0%", LOCAL_SETTINGS)
+EDGE_TTS_TIMEOUT_SECONDS = max(read_int("EDGE_TTS_TIMEOUT_SECONDS", 25, LOCAL_SETTINGS), 3)
 
-VOCU_API_KEY = _read_str("VOCU_API_KEY", "")
-VOCU_VOICE_ID = _read_str("VOCU_VOICE_ID", "")
-VOCU_SHARE_ID = _extract_uuid_or_raw(_read_str("VOCU_SHARE_ID", ""))
-VOCU_PROMPT_ID = _read_str("VOCU_PROMPT_ID", "default")
-VOCU_PRESET = _read_str("VOCU_PRESET", "v2_balance")
-VOCU_FLASH = _read_bool("VOCU_FLASH", False)
-VOCU_BREAK_CLONE = _read_bool("VOCU_BREAK_CLONE", True)
-VOCU_SHARPEN = _read_bool("VOCU_SHARPEN", False)
-VOCU_RANDOMNESS = _read_int("VOCU_RANDOMNESS", 100)
-VOCU_STABILITY_BOOST = _read_int("VOCU_STABILITY_BOOST", 1024)
-VOCU_PROBABILITY_OPTIMIZATION = _read_int("VOCU_PROBABILITY_OPTIMIZATION", 100)
-VOCU_SEED = _read_int("VOCU_SEED", -1)
-VOCU_TASK_TIMEOUT_SECONDS = _read_int("VOCU_TASK_TIMEOUT_SECONDS", 90)
-VOCU_TASK_POLL_INTERVAL_MS = _read_int("VOCU_TASK_POLL_INTERVAL_MS", 1000)
+VOCU_API_KEY = read_str("VOCU_API_KEY", "", LOCAL_SETTINGS)
+VOCU_VOICE_ID = read_str("VOCU_VOICE_ID", "", LOCAL_SETTINGS)
+VOCU_SHARE_ID = _extract_uuid_or_raw(read_str("VOCU_SHARE_ID", "", LOCAL_SETTINGS))
+VOCU_PROMPT_ID = read_str("VOCU_PROMPT_ID", "default", LOCAL_SETTINGS)
+VOCU_PRESET = read_str("VOCU_PRESET", "v2_balance", LOCAL_SETTINGS)
+VOCU_FLASH = read_bool("VOCU_FLASH", False, LOCAL_SETTINGS)
+VOCU_BREAK_CLONE = read_bool("VOCU_BREAK_CLONE", True, LOCAL_SETTINGS)
+VOCU_SHARPEN = read_bool("VOCU_SHARPEN", False, LOCAL_SETTINGS)
+VOCU_RANDOMNESS = read_int("VOCU_RANDOMNESS", 100, LOCAL_SETTINGS)
+VOCU_STABILITY_BOOST = read_int("VOCU_STABILITY_BOOST", 1024, LOCAL_SETTINGS)
+VOCU_PROBABILITY_OPTIMIZATION = read_int("VOCU_PROBABILITY_OPTIMIZATION", 100, LOCAL_SETTINGS)
+VOCU_SEED = read_int("VOCU_SEED", -1, LOCAL_SETTINGS)
+VOCU_TASK_TIMEOUT_SECONDS = read_int("VOCU_TASK_TIMEOUT_SECONDS", 90, LOCAL_SETTINGS)
+VOCU_TASK_POLL_INTERVAL_MS = read_int("VOCU_TASK_POLL_INTERVAL_MS", 1000, LOCAL_SETTINGS)
 
 _VOCU_BASE_URL = "https://v1.vocu.ai/api"
+HTTP_ERROR_THRESHOLD = 400
+HTTP_FORBIDDEN = 403
 _vocu_client: httpx.AsyncClient | None = None
 _cached_vocu_voice_id: str | None = None
 
@@ -124,7 +94,17 @@ def _run_edge_tts(text: str, audio_path: str) -> None:
     last_code = 0
 
     for _ in range(2):
-        result = subprocess.run(command, check=False)
+        try:
+            result = subprocess.run(
+                command,
+                check=False,
+                timeout=EDGE_TTS_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired as error:
+            last_code = -1
+            print(f"[edge-tts] timeout after {EDGE_TTS_TIMEOUT_SECONDS}s: {error}")
+            time.sleep(1)
+            continue
         last_code = result.returncode
         if result.returncode == 0 and audio_file.exists() and audio_file.stat().st_size > 0:
             return
@@ -150,11 +130,11 @@ def _extract_error_message(data: Any) -> str:
 
 
 def _has_vocu_api_error(status_code: int, data: Any) -> bool:
-    if status_code >= 400:
+    if status_code >= HTTP_ERROR_THRESHOLD:
         return True
     if isinstance(data, dict):
         api_status = data.get("status")
-        if isinstance(api_status, int) and api_status >= 400:
+        if isinstance(api_status, int) and api_status >= HTTP_ERROR_THRESHOLD:
             return True
     return False
 
@@ -238,7 +218,7 @@ async def _ensure_vocu_voice_id() -> str:
         json={"shareId": VOCU_SHARE_ID},
     )
     data = response.json()
-    if response.status_code >= 400:
+    if response.status_code >= HTTP_ERROR_THRESHOLD:
         raise RuntimeError(_extract_error_message(data))
 
     voice_id = data.get("voiceId") or data.get("data", {}).get("voiceId")
@@ -314,7 +294,7 @@ async def _run_vocu_tts(text: str, audio_path: str) -> None:
     )
     data = response.json()
     if _has_vocu_api_error(response.status_code, data):
-        if response.status_code == 403 or data.get("status") == 403:
+        if response.status_code == HTTP_FORBIDDEN or data.get("status") == HTTP_FORBIDDEN:
             await _run_vocu_async_tts(text, audio_path, voice_id)
             return
         raise RuntimeError(_extract_error_message(data))

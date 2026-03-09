@@ -1,5 +1,17 @@
 # AI Vtuber
 
+## License
+
+This repository is now proprietary (`All Rights Reserved`). See `LICENSE` and `CLOSED_SOURCE_NOTICE.md`.
+
+> 商用使用建议先阅读：`USER_MANUAL.md`
+>
+> 依赖安装（推荐）：
+>
+> ```bash
+> pip install -r requirements.txt
+> ```
+
 AI Vtuber是一个简单的虚拟主播，可以在Bilibili直播中与观众实时互动。它支持 OpenAI、DeepSeek、GLM 三家兼容 `chat/completions` 的接口，也支持 Edge TTS / Vocu 两种语音合成方式，并保留本地问答语料作为兜底。
 
 交流群：[745682833](https://jq.qq.com/?_wv=1027&k=IO1usMMj)

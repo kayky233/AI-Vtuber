@@ -4,7 +4,7 @@ import asyncio
 import os
 import time
 import uuid
-from collections import defaultdict, deque
+from collections import OrderedDict, deque
 from dataclasses import dataclass
 from typing import Any
 
@@ -178,6 +178,7 @@ class LLMChatBot:
         self.temperature = _read_float("VTUBER_LLM_TEMPERATURE", 0.75)
         self.max_tokens = _read_int("VTUBER_LLM_MAX_TOKENS", 80)
         self.history_pairs = max(_read_int("VTUBER_HISTORY_PAIRS", 2), 0)
+        self.max_history_users = max(_read_int("VTUBER_HISTORY_USERS", 500), 50)
         self.timeout = max(_read_float("VTUBER_LLM_TIMEOUT", 12.0), 1.0)
         self.reply_deadline = max(_read_float("VTUBER_REPLY_DEADLINE", 6.0), 0.5)
         self.provider_timeout = max(_read_float("VTUBER_PROVIDER_TIMEOUT", 4.0), 0.5)
@@ -196,7 +197,7 @@ class LLMChatBot:
             if self.providers
             else None
         )
-        self._histories: dict[str, deque[dict[str, str]]] = defaultdict(self._new_history)
+        self._histories: OrderedDict[str, deque[dict[str, str]]] = OrderedDict()
         self._provider_disabled_until: dict[str, float] = {}
 
     def _new_history(self) -> deque[dict[str, str]]:
@@ -228,7 +229,7 @@ class LLMChatBot:
             last_error: Exception | None = None
             for provider in self.providers:
                 disabled_until = self._provider_disabled_until.get(provider.name, 0.0)
-                if disabled_until > time.time():
+                if disabled_until > time.monotonic():
                     continue
 
                 remaining_time = overall_deadline - time.monotonic()
@@ -246,13 +247,13 @@ class LLMChatBot:
                         f"{provider.name} timed out after {request_timeout:.1f}s"
                     )
                     self._provider_disabled_until[provider.name] = (
-                        time.time() + self.provider_timeout_retry_after
+                        time.monotonic() + self.provider_timeout_retry_after
                     )
                     print(f"[{provider.name}超时]：{request_timeout:.1f}s")
                 except Exception as error:
                     last_error = error
                     self._provider_disabled_until[provider.name] = (
-                        time.time() + self.provider_retry_after
+                        time.monotonic() + self.provider_retry_after
                     )
                     print(f"[{provider.name}错误]：{error}")
                 else:
@@ -284,7 +285,7 @@ class LLMChatBot:
             raise RuntimeError("HTTP client is not initialized")
 
         messages: list[dict[str, str]] = [{"role": "system", "content": self.system_prompt}]
-        messages.extend(list(self._histories[user_id]))
+        messages.extend(list(self._history_for(user_id)))
         messages.append({"role": "user", "content": prompt})
 
         payload: dict[str, Any] = {
@@ -319,9 +320,19 @@ class LLMChatBot:
     def _remember_turn(self, user_id: str, prompt: str, response_text: str) -> None:
         if self.history_pairs <= 0:
             return
-        history = self._histories[user_id]
+        history = self._history_for(user_id)
         history.append({"role": "user", "content": prompt})
         history.append({"role": "assistant", "content": response_text})
+
+    def _history_for(self, user_id: str) -> deque[dict[str, str]]:
+        history = self._histories.get(user_id)
+        if history is None:
+            history = self._new_history()
+            self._histories[user_id] = history
+        self._histories.move_to_end(user_id)
+        while len(self._histories) > self.max_history_users:
+            self._histories.popitem(last=False)
+        return history
 
     def _fast_local_response(self, prompt: str) -> BotResponse | None:
         if self.local_fallback is None:
